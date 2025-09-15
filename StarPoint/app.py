@@ -1,10 +1,13 @@
-# app.py — StarPoint (SQLite) con descargas que restan puntos
-# Cambios:
-# - Ingreso de montos NUMÉRICO (number_input).
-# - Visualización de montos con puntos de miles (2.000 / 10.000 / 100.000).
-# - Refresco automático tras registrar carga/descarga (st.rerun).
+# app.py — StarPoint (SQLite) FULL (Excel-friendly CSV)
+# - Mínimo para registrar: >= 2000
+# - Puntos = monto * 0.0002 (cada 2.000 => 0.4)
+# - Descarga: resta puntos; saldo puede ser negativo
+# - Historial sin "None"; montos formateados "2.000"
+# - Refresco automático tras registrar (st.rerun)
+# - Exportar: Situación actual (CSV ; y ,) + Base completa (ZIP con CSV ; y , + backup .db)
+# - Normaliza usuarios (TRIM) para resumen correcto
 
-import os
+import os, io, zipfile, tempfile
 import sqlite3
 from pathlib import Path
 from datetime import datetime, date
@@ -52,7 +55,7 @@ def fmt_miles(n: float) -> str:
     except Exception:
         return str(n)
 
-# -------- Puntos proporcionales: cada $2000 => 0.4 --------
+# Puntos proporcionales: cada $2000 => 0.4
 def puntos_por_monto(monto: float) -> float:
     return 0.0 if monto < 2000 else round(monto * 0.0002, 2)
 
@@ -91,6 +94,12 @@ def init_db(conn: sqlite3.Connection):
         # Reparación de nulos para que no aparezca "None" en historial
         conn.execute("UPDATE cargas  SET ts            = COALESCE(ts,            CURRENT_TIMESTAMP) WHERE ts            IS NULL;")
         conn.execute("UPDATE retiros SET notificado_en = COALESCE(notificado_en, CURRENT_TIMESTAMP) WHERE notificado_en IS NULL;")
+
+def normalize_users(conn):
+    """Normaliza usuarios (TRIM) para evitar duplicados por espacios en el resumen."""
+    with conn:
+        conn.execute("UPDATE cargas  SET usuario = TRIM(usuario) WHERE usuario != TRIM(usuario);")
+        conn.execute("UPDATE retiros SET usuario = TRIM(usuario) WHERE usuario != TRIM(usuario);")
 
 def list_usuarios(conn: sqlite3.Connection) -> list[str]:
     q = """
@@ -149,10 +158,112 @@ def historial_usuario(conn: sqlite3.Connection, usuario: str, limit: int = 200) 
     """
     return pd.read_sql_query(q, conn, params=(usuario, usuario, limit))
 
+# -------- Resumen general (todos los usuarios) --------
+def resumen_general(conn):
+    """
+    Resumen por usuario con montos, puntos y último movimiento.
+    Agrupa por TRIM(usuario) para evitar duplicados por espacios.
+    """
+    q = """
+    WITH
+    u AS (
+      SELECT TRIM(usuario) AS usuario FROM cargas
+      UNION
+      SELECT TRIM(usuario) AS usuario FROM retiros
+    ),
+    c AS (
+      SELECT TRIM(usuario) AS usuario,
+             SUM(monto) AS monto_c,
+             SUM(puntos) AS pts_c,
+             MAX(ts)    AS last_c
+      FROM cargas
+      GROUP BY TRIM(usuario)
+    ),
+    r AS (
+      SELECT TRIM(usuario) AS usuario,
+             SUM(monto) AS monto_r,
+             SUM(puntos) AS pts_r,
+             MAX(notificado_en) AS last_r
+      FROM retiros
+      GROUP BY TRIM(usuario)
+    )
+    SELECT
+      u.usuario AS Usuario,
+      COALESCE(c.monto_c, 0) AS Monto_cargas,
+      COALESCE(r.monto_r, 0) AS Monto_descargas,
+      COALESCE(c.pts_c, 0)   AS Puntos_cargas,
+      COALESCE(r.pts_r, 0)   AS Puntos_descargas,
+      COALESCE(c.pts_c, 0) - COALESCE(r.pts_r, 0) AS Puntos_actuales,
+      strftime('%d/%m/%Y %H:%M', MAX(COALESCE(c.last_c, r.last_r))) AS Ultimo_movimiento
+    FROM u
+    LEFT JOIN c ON c.usuario = u.usuario
+    LEFT JOIN r ON r.usuario = u.usuario
+    GROUP BY u.usuario
+    ORDER BY u.usuario COLLATE NOCASE;
+    """
+    return pd.read_sql_query(q, conn)
+
+# -------- Export helpers --------
+def sqlite_backup_bytes(conn: sqlite3.Connection) -> bytes:
+    """Backup binario del SQLite aunque esté abierto."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        tmp_name = tmp.name
+    try:
+        dst = sqlite3.connect(tmp_name)
+        with dst:
+            conn.backup(dst)
+        dst.close()
+        with open(tmp_name, "rb") as f:
+            data = f.read()
+    finally:
+        try:
+            os.remove(tmp_name)
+        except Exception:
+            pass
+    return data
+
+def make_full_export_zip(conn: sqlite3.Connection) -> bytes:
+    """
+    ZIP con:
+    - cargas.csv
+    - descargas.csv (retiros)
+    - resumen_actual.csv
+    - StarPoint_backup.db (backup)
+    (CSV amigables para Excel ES: sep=';' y decimal=',')
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        df_c = pd.read_sql_query(
+            "SELECT id, usuario, monto, strftime('%d/%m/%Y %H:%M', ts) AS fecha, puntos FROM cargas ORDER BY ts DESC;",
+            conn
+        )
+        df_r = pd.read_sql_query(
+            "SELECT id, usuario, monto, strftime('%d/%m/%Y %H:%M', notificado_en) AS fecha, puntos FROM retiros ORDER BY notificado_en DESC;",
+            conn
+        )
+        df_s = resumen_general(conn)
+
+        zf.writestr(
+            "cargas.csv",
+            df_c.round(2).to_csv(index=False, sep=';', decimal=',', float_format='%.2f').encode("utf-8-sig")
+        )
+        zf.writestr(
+            "descargas.csv",
+            df_r.round(2).to_csv(index=False, sep=';', decimal=',', float_format='%.2f').encode("utf-8-sig")
+        )
+        zf.writestr(
+            "resumen_actual.csv",
+            df_s.round(2).to_csv(index=False, sep=';', decimal=',', float_format='%.2f').encode("utf-8-sig")
+        )
+        zf.writestr("StarPoint_backup.db", sqlite_backup_bytes(conn))
+    buffer.seek(0)
+    return buffer.getvalue()
+
 # --------------------------- Estado app -------------------------------
 
 conn = get_conn()
 init_db(conn)
+normalize_users(conn)  # normaliza usuarios (TRIM) para resumen correcto
 
 if "selected_user" not in st.session_state:
     st.session_state.selected_user = ""
@@ -171,7 +282,6 @@ with left:
         with c1:
             usuario = st.text_input("Usuario", value=st.session_state.get("selected_user", ""), placeholder="Ej.: maru5040")
         with c2:
-            # Ingreso numérico; mostrará 2000, vos lo ingresás así y la app lo mostrará como 2.000 en vistas
             monto = st.number_input("Monto (≥ 2.000)", min_value=0.0, step=100.0, value=0.0)
         submit_carga = st.form_submit_button("➕ Registrar", use_container_width=True)
 
@@ -199,8 +309,8 @@ with left:
             st.info("Sin movimientos para este usuario aún.")
         else:
             df_disp = df.drop(columns=["dt"]).copy()
-            # Mostrar montos con puntos de miles
-            df_disp["Monto"] = df_disp["Monto"].apply(fmt_miles)
+            df_disp["Monto"]  = df_disp["Monto"].apply(fmt_miles)  # mostrar 2.000 / 10.000
+            df_disp["Puntos"] = df_disp["Puntos"].round(2)        # redondeo visual a 2 decimales
             st.dataframe(df_disp, use_container_width=True, height=360, hide_index=True)
     else:
         st.caption("Tip: al registrar una carga, el usuario queda seleccionado automáticamente.")
@@ -249,5 +359,39 @@ with right:
                 st.warning(f"Descarga registrada para **{ur}** • −**{pts_r}** puntos (monto {fmt_miles(monto_r)})", icon="⚠️")
                 st.rerun()  # refresco automático tras registrar
 
+# -------- Export / Descargas --------
+st.divider()
+st.subheader("Descargas / Exportar")
+
+colA, colB = st.columns(2)
+
+with colA:
+    df_resumen = resumen_general(conn)
+    # CSV amigable para Excel ES: ; como separador de columnas, , como decimal
+    csv_text = df_resumen.round(2).to_csv(
+        index=False,
+        sep=';',
+        decimal=',',
+        float_format='%.2f'
+    )
+    csv_bytes = csv_text.encode("utf-8-sig")
+    st.download_button(
+        "⬇️ Descargar situación actual (CSV)",
+        data=csv_bytes,
+        file_name=f"situacion_{datetime.now():%Y%m%d_%H%M}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+with colB:
+    zip_bytes = make_full_export_zip(conn)
+    st.download_button(
+        "⬇️ Descargar base de datos completa (ZIP)",
+        data=zip_bytes,
+        file_name=f"starpoint_backup_{datetime.now():%Y%m%d_%H%M}.zip",
+        mime="application/zip",
+        use_container_width=True
+    )
+
 # --------------------------- Footer -----------------------------------
-st.caption("StarPoint • SQLite • Mínimo 2000 • Puntos = monto × 0.0002 • Montos se muestran con puntos de miles.")
+st.caption("StarPoint • SQLite • Mínimo 2000 • Puntos = monto × 0.0002 • Descargas restan puntos • Export CSV/ZIP (Excel ES).")
